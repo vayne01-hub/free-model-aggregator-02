@@ -251,6 +251,44 @@ export function openAIJsonWithModel(body: Json, model: string): Json {
   return { ...body, model };
 }
 
+/** A rough token count for a text: a token per four bytes, and never zero for a non-empty text. */
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.ceil(Buffer.byteLength(text) / 4));
+}
+
+/** The answer's own text: its message content plus any tool calls' argument strings. */
+function answerText(body: Json): string {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  let text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  for (const call of calls) {
+    if (!isRecord(call) || !isRecord(call.function)) continue;
+    if (typeof call.function.arguments === 'string') text += call.function.arguments;
+  }
+  return text;
+}
+
+/**
+ * An answer whose usage can be read whole. Some free models answer without a usage object, or
+ * with an output count of zero beside a non-empty answer; the wire checks read an input count
+ * of at least 0 and an output count of at least 1, so a missing figure is filled with a
+ * deterministic estimate (the prompt's text for the input, the answer's own text for the
+ * output) and a present one is never touched. A pure function of the two bodies, so a replay
+ * fills it identically.
+ */
+export function ensureAnswerUsage(body: Json, promptText: string): Json {
+  const usage = isRecord(body.usage) ? body.usage : null;
+  const hasInput = usage !== null && typeof usage.prompt_tokens === 'number' && Number.isFinite(usage.prompt_tokens);
+  const hasOutput = usage !== null && typeof usage.completion_tokens === 'number' && Number.isFinite(usage.completion_tokens);
+  const input = hasInput ? (usage.prompt_tokens as number) : estimateTokens(promptText);
+  let output = hasOutput ? (usage.completion_tokens as number) : 0;
+  if (output <= 0 && answerText(body) !== '') output = estimateTokens(answerText(body));
+  if (usage !== null && hasInput && hasOutput && output === usage.completion_tokens) return body;
+  return { ...body, usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output } };
+}
+
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
 export function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;

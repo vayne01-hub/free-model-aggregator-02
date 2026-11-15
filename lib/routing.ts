@@ -7,8 +7,8 @@
 //
 // The entry runs on a free-tier key (about 50 free-model requests a day), so the walk is
 // deliberately frugal: candidates are dialled one at a time, a call is spent only on an actual
-// refusal — never speculatively, never in parallel — and a model that has refused once is
-// walked past for the rest of the trial unless nothing else can serve the prompt.
+// refusal — never speculatively, never in parallel — and a model that has been rate-limited
+// once is walked past for the rest of the trial unless nothing else can serve the prompt.
 
 import { isRecord, type ModelRow } from './providers.ts';
 
@@ -47,18 +47,28 @@ export function refusalCode(status: number, text: string): string {
 }
 
 /**
- * The trial's memory of refusals, by model id. A model that refused once is deprioritised for
- * every later prompt: a free model's 429 is a rate limit that outlives this trial's few seconds,
- * so spending another first-try call on it would waste the key's small daily allowance and the
- * tie-break alike. The model is never struck off entirely — when it is the only candidate left
- * that meets a prompt, the walk still reaches it.
+ * The trial's memory of refusals, by model id. Two rules sideline a model for later prompts:
+ *
+ *   - a 429 sidelines it at once. A free model's rate limit (20 requests a minute, and a small
+ *     daily allowance behind this entry's key) outlives this trial's few seconds, so another
+ *     first-try call on a rate-limited model would waste the key's allowance and the score's
+ *     tie-break alike;
+ *   - a second refusal of any kind sidelines it too. One 5xx is often a moment's fault (and the
+ *     walk already gives it an immediate retry inside its prompt), but a model that has refused
+ *     twice in one trial is treated as down for the trial's remainder, so later prompts walk
+ *     straight to the next candidate instead of paying the same refusal again.
+ *
+ * A sidelined model is never struck off entirely: when it is the only candidate left that meets
+ * a prompt, the walk still reaches it.
  */
 export class RefusalBook {
   private readonly counts = new Map<string, number>();
+  private readonly rateLimited = new Set<string>();
 
-  /** Record one refusal by `modelId`. */
-  note(modelId: string): void {
+  /** Record one refusal by `modelId`, with the HTTP status the gateway relayed. */
+  note(modelId: string, status: number): void {
     this.counts.set(modelId, (this.counts.get(modelId) ?? 0) + 1);
+    if (status === 429) this.rateLimited.add(modelId);
   }
 
   /** How often `modelId` has refused in this trial so far. */
@@ -66,19 +76,29 @@ export class RefusalBook {
     return this.counts.get(modelId) ?? 0;
   }
 
+  /** Whether `modelId` has been rate-limited (429) in this trial so far. */
+  isRateLimited(modelId: string): boolean {
+    return this.rateLimited.has(modelId);
+  }
+
+  /** Whether later prompts walk past `modelId` first: rate-limited once, or refused twice. */
+  sidelined(modelId: string): boolean {
+    return this.isRateLimited(modelId) || this.refusalsOf(modelId) >= 2;
+  }
+
   /**
-   * The walk for one prompt: the ranked candidates with every model that has already refused
-   * moved behind every model that has not, the ranked order kept inside each half. Pure in the
-   * book's state, so a replay walks the same list.
+   * The walk for one prompt: the ranked candidates with every sidelined model moved behind
+   * every model that is not, the ranked order kept inside each half. Pure in the book's state,
+   * so a replay walks the same list.
    */
   order(candidates: readonly ModelRow[]): ModelRow[] {
     const clean: ModelRow[] = [];
-    const refused: ModelRow[] = [];
+    const sidelined: ModelRow[] = [];
     for (const model of candidates) {
-      if (this.refusalsOf(model.id) > 0) refused.push(model);
+      if (this.sidelined(model.id)) sidelined.push(model);
       else clean.push(model);
     }
-    return [...clean, ...refused];
+    return [...clean, ...sidelined];
   }
 }
 
