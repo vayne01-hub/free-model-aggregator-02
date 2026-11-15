@@ -20,8 +20,8 @@
 //     5. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 the moment it says done: a
 //        process still running when the trial's wall is spent scores zero, so nothing here ever
 //        waits on anything else.
-//   `node main.ts --list` prints the catalog document and exits 0 before any server starts; the
-//   register body carries that same document, byte for byte.
+//   `node main.ts --list` prints the catalog document (lib/catalog.ts) and exits 0 before any
+//   server starts; the register body carries that same document, byte for byte.
 //
 // ROUTING (quality is 60% of the score)
 //   Each prompt is served by the best-rated free model that meets its requirements: the brief
@@ -60,13 +60,12 @@
 //   recorded answers back and the same walk happens again, leaving the same export.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { buildCatalog, catalogText, registrationPayload, type CatalogDocument } from './lib/catalog.ts';
 import {
-  buildCatalog,
   freeModels,
   isRecord,
   rankCandidates,
   readBrief,
-  type CatalogReport,
   type Json,
   type ModelRow,
   type Requirement,
@@ -86,8 +85,6 @@ import {
   type ServedModel,
 } from './lib/wire.ts';
 
-/** The wire protocol's version, in the register body. */
-const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this server reads. */
@@ -104,7 +101,7 @@ const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
 const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
 
 const brief = readBrief(PROMPT_FILE);
-const catalog: CatalogReport = buildCatalog(brief);
+const catalog: CatalogDocument = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
 /** The trial's refusal memory: which models have refused so far, and how often. */
@@ -368,11 +365,11 @@ function listen(server: Server): Promise<void> {
 }
 
 /** POST /register with the port and the one catalog; the env answers with the trial's prompt count. */
-async function register(port: number, report: CatalogReport): Promise<void> {
+async function register(port: number): Promise<void> {
   const res = await fetch(`${ENV_URL}/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
+    body: JSON.stringify(registrationPayload(port, catalog)),
     signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
@@ -411,7 +408,7 @@ async function start(): Promise<void> {
     // The same document the register body carries, byte for byte: print the one built object and
     // stop before any server starts. A process whose stdout is not flushed loses the tail, so
     // wait for the write to land.
-    const text = `${JSON.stringify(catalog)}\n`;
+    const text = catalogText(catalog);
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
   }
@@ -430,7 +427,7 @@ async function start(): Promise<void> {
   // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
-  await register(port, catalog);
+  await register(port);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
   poll(server);
