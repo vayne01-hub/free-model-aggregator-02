@@ -64,10 +64,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   buildCatalog,
-  capabilitiesOf,
   freeModels,
   isRecord,
-  meetsRequirements,
+  rankCandidates,
   readBrief,
   type CatalogReport,
   type Json,
@@ -124,16 +123,14 @@ function servedModels(): ServedModel[] {
 }
 
 /**
- * The one free model that serves a request. TODO(quality): rank every free candidate that meets the
- * requirements by the brief's rating_milli (quality is 60% of the score) and prefer the best. This
- * baseline takes the first free model in the brief's order that meets the requirements.
+ * The one free model that serves a request when nothing has refused yet: the best-rated free
+ * candidate that meets the requirements. Quality is 60% of the score and is the served model's
+ * published rating over the best rating a meeting model carries, so the head of the ranked list
+ * is the only first choice that makes sense; the rest of the ranking is the failover order the
+ * serving loop below walks when a call is refused.
  */
 function routeFor(requires: Requirement): ModelRow | null {
-  for (const model of freeModels(brief)) {
-    if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
-    return model;
-  }
-  return null;
+  return rankCandidates(brief, requires)[0] ?? null;
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */

@@ -243,6 +243,21 @@ export function freeModels(brief: Brief): ModelRow[] {
   return brief.models.filter((m) => m.free);
 }
 
+/**
+ * Every free model that can serve a prompt with `requires`, best first: the brief's published
+ * rating decides, and the brief's own order breaks a tie, so the ranking is a pure function of
+ * the brief — the same list on a live pass and on its replay. Quality is the weighted rating of
+ * the model that really served each prompt over the best rating a meeting model carries, so the
+ * head of this list is where a prompt wants to be served from; the tail is its failover order.
+ */
+export function rankCandidates(brief: Brief, requires: Requirement): ModelRow[] {
+  return freeModels(brief)
+    .map((model, index) => ({ model, index }))
+    .filter(({ model }) => meetsRequirements(requires, capabilitiesOf(model)))
+    .sort((a, b) => b.model.rating_milli - a.model.rating_milli || a.index - b.index)
+    .map(({ model }) => model);
+}
+
 /** What a model can do, as the brief's row says it. */
 export function capabilitiesOf(model: ModelRow): Capabilities {
   return {
