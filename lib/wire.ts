@@ -320,11 +320,67 @@ function frameWithModel(frame: string, model: string): string {
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
  * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
  * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
+ *
+ * One repair is made on the way through. The gateway forwards with stream_options.include_usage set,
+ * so a usage chunk should close the stream — but a provider that ignores the option leaves the client
+ * with no usage to read, and the wire checks read one. When the stream produced content yet no chunk
+ * carried usage, a closing usage chunk is synthesised just before [DONE], in the place OpenAI itself
+ * puts it: the output count estimated from the streamed content, the input from the prompt's text
+ * (promptText), both by estimateTokens' rule. A stream that did carry usage passes untouched.
  */
-export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string, promptText: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let sawUsage = false;
+  let contentChars = 0;
+  let lastId = 'chatcmpl-stream';
+  let lastCreated = 0;
+
+  /** Read one frame's chunks into the stream's state; true when the frame is the [DONE] frame. */
+  const scanFrame = (frame: string): boolean => {
+    let isDone = false;
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '[DONE]') {
+        isDone = true;
+        continue;
+      }
+      if (payload === '') continue;
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(chunk)) continue;
+      if (typeof chunk.id === 'string' && chunk.id !== '') lastId = chunk.id;
+      if (typeof chunk.created === 'number') lastCreated = chunk.created;
+      if (isRecord(chunk.usage) && typeof chunk.usage.completion_tokens === 'number') sawUsage = true;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      const choice = isRecord(choices[0]) ? choices[0] : null;
+      if (choice === null || !isRecord(choice.delta)) continue;
+      if (typeof choice.delta.content === 'string') contentChars += choice.delta.content.length;
+      const calls = Array.isArray(choice.delta.tool_calls) ? choice.delta.tool_calls : [];
+      for (const call of calls) {
+        if (isRecord(call) && isRecord(call.function) && typeof call.function.arguments === 'string') contentChars += call.function.arguments.length;
+      }
+    }
+    return isDone;
+  };
+
+  /** The frame to relay for one raw frame: a synthesised usage frame first, when [DONE] needs one. */
+  const relayFrame = (frame: string): string => {
+    const isDone = scanFrame(frame);
+    if (!isDone || sawUsage || contentChars === 0) return frameWithModel(frame, model);
+    const input = estimateTokens(promptText);
+    const output = Math.max(1, Math.ceil(contentChars / 4));
+    const usageChunk = { id: lastId, object: 'chat.completion.chunk', created: lastCreated, model, choices: [], usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output } };
+    return `data: ${JSON.stringify(usageChunk)}\n\n${frameWithModel(frame, model)}`;
+  };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -334,12 +390,12 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        yield relayFrame(frame);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield relayFrame(buffer);
   } finally {
     reader.releaseLock();
   }
@@ -363,6 +419,10 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   const toolIndexes = new Map<number, number>();
   let inputTokens = 0;
   let outputTokens = 0;
+  // The answer's own characters, counted as they stream: when a provider's stream carries no
+  // usage chunk at all, the closing usage still has to name an output count of at least 1 for a
+  // non-empty answer, and this count is what that fallback is estimated from.
+  let contentChars = 0;
 
   const startEvents = (): string[] => {
     if (started) return [];
@@ -396,9 +456,12 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   const finishEvents = (stopReason: string): string[] => {
     if (finished) return [];
     finished = true;
+    // A provider usage figure wins; with none, estimate the output from what actually streamed
+    // (estimateTokens' rule: a token per four characters, never zero for a non-empty answer).
+    const outTokens = outputTokens > 0 ? outputTokens : contentChars > 0 ? Math.max(1, Math.ceil(contentChars / 4)) : outputTokens;
     return [
       ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
+      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outTokens } }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
   };
@@ -436,6 +499,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
           nextIndex += 1;
           out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
         }
+        contentChars += delta.content.length;
         out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } }));
       }
       const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
@@ -467,6 +531,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
         }
         const fn = isRecord(call.function) ? call.function : {};
         if (typeof fn.arguments === 'string' && fn.arguments !== '') {
+          contentChars += fn.arguments.length;
           out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
         }
       }

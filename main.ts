@@ -77,6 +77,7 @@ import {
   anthropicEventsFromOpenAI,
   anthropicModelList,
   anthropicToOpenAI,
+  ensureAnswerUsage,
   openAIError,
   openAIJsonWithModel,
   openAIModelList,
@@ -236,13 +237,16 @@ async function dial(model: string, body: Json): Promise<Response> {
 /**
  * A successful gateway answer, relayed to the client in its own wire: the dialled model's id on
  * every answer and every chunk, the usage and the stop reason whole, and the refusal trail on
- * the response header when this prompt was recovered after one or more refusals.
+ * the response header when this prompt was recovered after one or more refusals. A JSON answer's
+ * usage is first made whole (lib/wire.ts ensureAnswerUsage): some free models answer with no
+ * usage object at all, and the wire checks read one.
  */
 async function relay(
   res: ServerResponse,
   wire: 'openai' | 'anthropic',
   streamed: boolean,
   upstream: Response,
+  upstreamBody: Json,
   model: ModelRow,
   trail: readonly TrailRow[],
 ): Promise<void> {
@@ -255,7 +259,7 @@ async function relay(
       if (wire === 'anthropic') {
         for await (const event of anthropicEventsFromOpenAI(upstream.body as ReadableStream<Uint8Array>, model.id)) res.write(event);
       } else {
-        for await (const frame of openAIStreamWithModel(upstream.body as ReadableStream<Uint8Array>, model.id)) res.write(frame);
+        for await (const frame of openAIStreamWithModel(upstream.body as ReadableStream<Uint8Array>, model.id, JSON.stringify(upstreamBody.messages ?? []))) res.write(frame);
       }
     } finally {
       res.end();
@@ -263,7 +267,7 @@ async function relay(
     return;
   }
   const answer: unknown = await upstream.json();
-  const record = isRecord(answer) ? answer : {};
+  const record = ensureAnswerUsage(isRecord(answer) ? answer : {}, JSON.stringify(upstreamBody.messages ?? []));
   if (wire === 'anthropic') sendJson(res, 200, openAIToAnthropic(record, model.id), headers);
   else sendJson(res, 200, openAIJsonWithModel(record, model.id), headers);
 }
@@ -304,9 +308,10 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
   while (index < candidates.length && attempts < MAX_ATTEMPTS_PER_PROMPT) {
     const model = candidates[index];
     attempts += 1;
+    const upstreamBody = buildUpstream(wire, body, model);
     let upstream: Response;
     try {
-      upstream = await dial(model.id, buildUpstream(wire, body, model));
+      upstream = await dial(model.id, upstreamBody);
     } catch (err) {
       // The gateway itself did not answer: no response exists to trail, and the walk moves on.
       last = { status: 502, text: (err as Error).message };
@@ -314,7 +319,7 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
       continue;
     }
     if (upstream.ok && upstream.body !== null) {
-      await relay(res, wire, body.stream === true, upstream, model, trail);
+      await relay(res, wire, body.stream === true, upstream, upstreamBody, model, trail);
       return;
     }
     if (upstream.ok) {
