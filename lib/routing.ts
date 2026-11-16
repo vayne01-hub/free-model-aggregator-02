@@ -17,6 +17,24 @@ export const MAX_ATTEMPTS_PER_PROMPT = 4;
 /** The trail's own cap: the rules read at most 8 rows, and a longer trail is read as none. */
 export const MAX_TRAIL_ROWS = 8;
 
+/**
+ * The time budget of one attempt, by its place in the walk, in milliseconds. The house gives
+ * a prompt 30 seconds to be answered; a free model that is going to answer usually does so in
+ * a few seconds, so an attempt still silent at its budget is one the prompt cannot afford to
+ * keep waiting on. The budget only ever cuts an attempt short: the gateway tears the call down
+ * when this server lets go, the house's record keeps the partial answer that arrived, and the
+ * walk's verdict on a partial answer (lib/verify.ts) is the same in a live pass and in its
+ * replay — so the attempt the budget ended is walked past identically in both, and no choice
+ * the walk makes ever depends on the clock: the budgets are fixed constants, and which attempt
+ * a prompt is on is a function of the answers alone.
+ */
+export const ATTEMPT_TIMEOUT_MS: readonly number[] = [15_000, 9_000, 6_000, 6_000];
+
+/** The budget of the attempt with this 0-based index in its prompt's walk. */
+export function attemptTimeoutMs(attemptIndex: number): number {
+  return ATTEMPT_TIMEOUT_MS[Math.min(attemptIndex, ATTEMPT_TIMEOUT_MS.length - 1)];
+}
+
 /** One row of the `x-makefun-upstream-failures` trail, in the rules' own shape. */
 export interface TrailRow {
   status: number;
@@ -47,16 +65,18 @@ export function refusalCode(status: number, text: string): string {
 }
 
 /**
- * The trial's memory of refusals, by model id. Two rules sideline a model for later prompts:
+ * The trial's memory of refusals, by model id. One rule sidelines a model for later prompts:
  *
- *   - a 429 sidelines it at once. A free model's rate limit (20 requests a minute, and a small
- *     daily allowance behind this entry's key) outlives this trial's few seconds, so another
- *     first-try call on a rate-limited model would waste the key's allowance and the score's
- *     tie-break alike;
- *   - a second refusal of any kind sidelines it too. One 5xx is often a moment's fault (and the
- *     walk already gives it an immediate retry inside its prompt), but a model that has refused
- *     twice in one trial is treated as down for the trial's remainder, so later prompts walk
- *     straight to the next candidate instead of paying the same refusal again.
+ *   - any refusal sidelines it at once. A trial lasts a few minutes at most, and a free model
+ *     that has just refused — rate-limited (20 requests a minute, and a small daily allowance
+ *     behind this entry's key), down at its provider, or answering unusably — is in the same
+ *     state when the next prompt arrives seconds later, so a later prompt that led with it
+ *     would pay the same refusal again, in the coin the trial is shortest of: the 30 seconds
+ *     the house gives each prompt. Fast demotion costs little when the refusal was a moment's
+ *     fault: the sidelined model keeps its ranked place among the sidelined, and the walk
+ *     reaches it again inside the same prompt's own attempt budget only when it is that
+ *     prompt's own candidate — for later prompts it stands behind every model that has not
+ *     refused, which is where a recovered prompt wants its first call spent anyway.
  *
  * A sidelined model is never struck off entirely: when it is the only candidate left that meets
  * a prompt, the walk still reaches it.
@@ -81,9 +101,9 @@ export class RefusalBook {
     return this.rateLimited.has(modelId);
   }
 
-  /** Whether later prompts walk past `modelId` first: rate-limited once, or refused twice. */
+  /** Whether later prompts walk past `modelId` first: it has refused once in this trial. */
   sidelined(modelId: string): boolean {
-    return this.isRateLimited(modelId) || this.refusalsOf(modelId) >= 2;
+    return this.isRateLimited(modelId) || this.refusalsOf(modelId) >= 1;
   }
 
   /**
