@@ -40,9 +40,12 @@
 //   twice. Any refusal at all sidelines its model for the trial's later prompts
 //   (lib/routing.ts RefusalBook): a free model's rate limit, outage or bad-answer habit
 //   outlives this trial's seconds, so later prompts lead with a model that has not refused —
-//   unless it is the only candidate left. One prompt costs at most MAX_ATTEMPTS_PER_PROMPT
-//   calls; the whole trial stays far under the gateway's 60-call cap, and the common trial
-//   costs exactly one call per prompt, which is also what the score's tie-break rewards.
+//   unless it is the only candidate left; a refusal that names the key or the model itself
+//   (a 401, 403 or 404) walks behind even the softly refused, and one model the key cannot
+//   use at all walks last from the start (lib/routing.ts DEPRIORITIZED_MODELS). One prompt
+//   costs at most MAX_ATTEMPTS_PER_PROMPT calls; the whole trial stays far under the
+//   gateway's 60-call cap, and the common trial costs exactly one call per prompt, which is
+//   also what the score's tie-break rewards.
 //   A prompt recovered after refusals reports them on its response header
 //   `x-makefun-upstream-failures` (lib/routing.ts trailHeader): that header is the only way the
 //   failover column can see a refusal the walk recovered from, because the env sees this
@@ -60,7 +63,7 @@
 //   reason: a stream is only relayed once its recorded bytes are known to close properly and
 //   to carry the token.
 //   Each attempt also carries a fixed time budget (lib/routing.ts ATTEMPT_TIMEOUT_MS): the
-//   first attempt may take 9 of the prompt's 30 seconds, later ones less, and all six
+//   first attempt may take 8 of the prompt's 30 seconds, later ones less, and all eight
 //   together stay under the 30, so one hanging model cannot spend the whole prompt. The
 //   budget only ever cuts an attempt short, and a cut attempt replays identically: cut
 //   before its answer arrived, the house's record of it is a 499 (client closed the
@@ -94,7 +97,7 @@ import {
   type ModelRow,
   type Requirement,
 } from './lib/providers.ts';
-import { MAX_ATTEMPTS_PER_PROMPT, RefusalBook, attemptTimeoutMs, refusalCode, trailHeader, type TrailRow } from './lib/routing.ts';
+import { MAX_ATTEMPTS_PER_PROMPT, RefusalBook, attemptTimeoutMs, deprioritize, refusalCode, trailHeader, type TrailRow } from './lib/routing.ts';
 import { declaredToolNames, tokenOfRequest, verifyJsonAnswer, verifyStreamAnswer } from './lib/verify.ts';
 import {
   anthropicError,
@@ -396,7 +399,7 @@ function giveUp(
 async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' | 'anthropic'): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, wire, 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = book.order(rankCandidates(brief, requirementsFor(body)));
+  const candidates = deprioritize(book.order(rankCandidates(brief, requirementsFor(body))));
   if (candidates.length === 0) {
     return sendError(res, wire, 503, wire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model in the brief meets this request');
   }
