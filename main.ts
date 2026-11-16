@@ -60,7 +60,7 @@
 //   reason: a stream is only relayed once its recorded bytes are known to close properly and
 //   to carry the token.
 //   Each attempt also carries a fixed time budget (lib/routing.ts ATTEMPT_TIMEOUT_MS): the
-//   first attempt may take 12 of the prompt's 30 seconds, later ones less, and all four
+//   first attempt may take 9 of the prompt's 30 seconds, later ones less, and all six
 //   together stay under the 30, so one hanging model cannot spend the whole prompt. The
 //   budget only ever cuts an attempt short, and a cut attempt replays identically: cut
 //   before its answer arrived, the house's record of it is a 499 (client closed the

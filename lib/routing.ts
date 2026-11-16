@@ -12,8 +12,15 @@
 
 import { isRecord, type ModelRow } from './providers.ts';
 
-/** The most gateway calls one prompt may cost, refusals included. */
-export const MAX_ATTEMPTS_PER_PROMPT = 4;
+/**
+ * The most gateway calls one prompt may cost, refusals included. Six is deep enough to walk
+ * past a dead ladder head, a rate limit and a silent zero or two and still reach the reliable
+ * middle of the table; a prompt that has refused six models is refused by the tier, not by a
+ * model, and further calls would spend the key's daily allowance on it. Failed attempts are
+ * not counted by the house's frugality tie-break (only answered calls are), so the depth is
+ * bought with time — bounded by the budgets below — not with standing.
+ */
+export const MAX_ATTEMPTS_PER_PROMPT = 6;
 /** The trail's own cap: the rules read at most 8 rows, and a longer trail is read as none. */
 export const MAX_TRAIL_ROWS = 8;
 
@@ -21,7 +28,7 @@ export const MAX_TRAIL_ROWS = 8;
  * The time budget of one attempt, by its place in the walk, in milliseconds. The house gives
  * a prompt 30 seconds to be answered; a free model that is going to answer usually does so in
  * a few seconds, so an attempt still silent at its budget is one the prompt cannot afford to
- * keep waiting on. All four budgets together stay under the house's 30 seconds, so even a
+ * keep waiting on. All six budgets together stay under the house's 30 seconds, so even a
  * walk that burns every budget gives up before the house hangs up. The budget only ever cuts
  * an attempt short, and a cut attempt replays identically: cut before its answer arrived, the
  * gateway's record of it is a 499 (client closed the request), which a replay hands back as
@@ -31,7 +38,7 @@ export const MAX_TRAIL_ROWS = 8;
  * the clock: the budgets are fixed constants, and which attempt a prompt is on is a function
  * of the answers alone.
  */
-export const ATTEMPT_TIMEOUT_MS: readonly number[] = [12_000, 7_000, 5_000, 4_000];
+export const ATTEMPT_TIMEOUT_MS: readonly number[] = [9_000, 6_000, 5_000, 4_000, 3_000, 2_000];
 
 /** The budget of the attempt with this 0-based index in its prompt's walk. */
 export function attemptTimeoutMs(attemptIndex: number): number {
