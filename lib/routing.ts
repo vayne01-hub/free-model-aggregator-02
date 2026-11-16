@@ -21,14 +21,17 @@ export const MAX_TRAIL_ROWS = 8;
  * The time budget of one attempt, by its place in the walk, in milliseconds. The house gives
  * a prompt 30 seconds to be answered; a free model that is going to answer usually does so in
  * a few seconds, so an attempt still silent at its budget is one the prompt cannot afford to
- * keep waiting on. The budget only ever cuts an attempt short: the gateway tears the call down
- * when this server lets go, the house's record keeps the partial answer that arrived, and the
- * walk's verdict on a partial answer (lib/verify.ts) is the same in a live pass and in its
- * replay — so the attempt the budget ended is walked past identically in both, and no choice
- * the walk makes ever depends on the clock: the budgets are fixed constants, and which attempt
- * a prompt is on is a function of the answers alone.
+ * keep waiting on. All four budgets together stay under the house's 30 seconds, so even a
+ * walk that burns every budget gives up before the house hangs up. The budget only ever cuts
+ * an attempt short, and a cut attempt replays identically: cut before its answer arrived, the
+ * gateway's record of it is a 499 (client closed the request), which a replay hands back as
+ * the attempt's response and the walk reads as the same attempt_timeout the live cut produced;
+ * cut mid-answer, the record is the partial body itself, and verification's verdict on those
+ * bytes (lib/verify.ts) is the same in both passes. No choice the walk makes ever depends on
+ * the clock: the budgets are fixed constants, and which attempt a prompt is on is a function
+ * of the answers alone.
  */
-export const ATTEMPT_TIMEOUT_MS: readonly number[] = [15_000, 9_000, 6_000, 6_000];
+export const ATTEMPT_TIMEOUT_MS: readonly number[] = [12_000, 7_000, 5_000, 4_000];
 
 /** The budget of the attempt with this 0-based index in its prompt's walk. */
 export function attemptTimeoutMs(attemptIndex: number): number {

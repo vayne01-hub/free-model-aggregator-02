@@ -60,11 +60,14 @@
 //   reason: a stream is only relayed once its recorded bytes are known to close properly and
 //   to carry the token.
 //   Each attempt also carries a fixed time budget (lib/routing.ts ATTEMPT_TIMEOUT_MS): the
-//   first attempt may take 15 of the prompt's 30 seconds, later ones less, so one hanging
-//   model cannot spend the whole prompt. The budget only ever cuts an attempt short — the
-//   gateway tears the call down when this server lets go and the house's record keeps the
-//   partial answer, which verification rejects on the same bytes in a live pass and in its
-//   replay — so the walk's choices stay a function of the answers alone.
+//   first attempt may take 12 of the prompt's 30 seconds, later ones less, and all four
+//   together stay under the 30, so one hanging model cannot spend the whole prompt. The
+//   budget only ever cuts an attempt short, and a cut attempt replays identically: cut
+//   before its answer arrived, the house's record of it is a 499 (client closed the
+//   request), which the walk reads as the same attempt_timeout the live cut produced; cut
+//   mid-answer, the record is the partial body itself, which verification rejects (or, if
+//   the token already arrived whole, accepts) on the same bytes in both passes — so the
+//   walk's choices stay a function of the answers alone.
 //
 // THE MODEL RULE
 //   A response's `model` field names the model this server really dialled, on every answer and
@@ -74,8 +77,11 @@
 //
 // DETERMINISM
 //   Every choice here is a function of the brief, the requests and the gateway's answers, in
-//   arrival order: no wall clock, no randomness, no timers in any decision. A replay serves the
-//   recorded answers back and the same walk happens again, leaving the same export.
+//   arrival order: no wall clock readings, no randomness. The one timer — an attempt's fixed
+//   budget — decides nothing by itself: what it cuts is frozen by the gateway into the record
+//   (a 499, or the partial body), and the walk reads that record, in a replay, to the same
+//   step it took live. A replay serves the recorded answers back and the same walk happens
+//   again, leaving the same export.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { buildCatalog, catalogText, registrationPayload, type CatalogDocument } from './lib/catalog.ts';
@@ -262,10 +268,40 @@ async function dial(model: string, body: Json, timeoutMs: number): Promise<Respo
   });
 }
 
-/** Whether a dial or a body read failed because the attempt's time budget ran out. */
+/** Whether a dial failed because the attempt's time budget ran out. */
 function isTimeoutError(err: unknown): boolean {
   const name = (err as { name?: unknown } | null)?.name;
   return name === 'TimeoutError' || name === 'AbortError';
+}
+
+/**
+ * Read an attempt's whole answer, keeping whatever arrived if the read is cut short. A cut
+ * read is not an error to the walk: the gateway froze the same partial bytes as the attempt's
+ * record when the attempt was cut, a replay serves exactly those bytes, and verification
+ * judges them — so the bytes that arrived are the answer of record, whole or partial, and
+ * the verdict on them is the same in a live pass and in its replay.
+ */
+async function readAnswerBody(upstream: Response): Promise<string> {
+  if (upstream.body === null) return '';
+  const reader = upstream.body.getReader();
+  const parts: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value !== undefined) parts.push(value);
+    }
+  } catch {
+    // Cut short (the attempt's budget, or the connection): what arrived is the record.
+  }
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const all = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    all.set(part, at);
+    at += part.length;
+  }
+  return new TextDecoder().decode(all);
 }
 
 /** The response headers for a relayed answer: the refusal trail, when this prompt was recovered. */
@@ -402,6 +438,16 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
       }
       continue;
     }
+    if (upstream.status === 499) {
+      // The gateway's record of an attempt the live pass cut at its budget: client closed the
+      // request. It is read as the attempt_timeout the live cut produced — same trail row,
+      // same note — so the replay walks this step exactly as the live pass did.
+      await upstream.text().catch(() => '');
+      trail.push({ status: 504, code: 'attempt_timeout', model: model.id });
+      book.note(model.id, 504);
+      last = { status: 504, text: `no answer within ${timeoutMs} ms` };
+      continue;
+    }
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
       trail.push({ status: upstream.status, code: refusalCode(upstream.status, text), model: model.id });
@@ -410,20 +456,9 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
       continue;
     }
     // A 2xx: read the whole answer before anything is relayed — the attempt's budget still
-    // governs the read — and verify it; an answer that would earn nothing is a refusal.
-    let raw: string;
-    try {
-      raw = await upstream.text();
-    } catch (err) {
-      if (isTimeoutError(err)) {
-        trail.push({ status: 504, code: 'attempt_timeout', model: model.id });
-        book.note(model.id, 504);
-        last = { status: 504, text: `the answer did not finish within ${timeoutMs} ms` };
-      } else {
-        last = { status: 502, text: (err as Error).message };
-      }
-      continue;
-    }
+    // governs the read, and a read it cuts leaves the partial bytes as the answer of record —
+    // and verify it; an answer that would earn nothing is a refusal.
+    const raw = await readAnswerBody(upstream);
     if (streamed) {
       const verdict = verifyStreamAnswer(raw, token, declared);
       if (!verdict.ok) {
