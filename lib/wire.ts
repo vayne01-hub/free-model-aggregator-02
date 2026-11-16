@@ -251,6 +251,27 @@ export function openAIJsonWithModel(body: Json, model: string): Json {
   return { ...body, model };
 }
 
+/** The finish reasons the house's stop-reason check accepts on the OpenAI wire. */
+const LEGAL_OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter']);
+
+/**
+ * An answer whose first choice names a finish reason the house can read. Most providers name
+ * one of the legal reasons and the body passes untouched; a provider that names none — or an
+ * exotic spelling of its own — would fail the shape and stop-reason checks over a label, not
+ * over the answer, so the choice is given the reason a completed answer carries: `stop`. A
+ * pure function of the body, like every repair here, so a replay repairs it identically.
+ */
+export function ensureFinishReason(body: Json): Json {
+  const choices = Array.isArray(body.choices) ? body.choices : null;
+  if (choices === null || choices.length === 0) return body;
+  const choice = choices[0];
+  if (!isRecord(choice)) return body;
+  if (typeof choice.finish_reason === 'string' && LEGAL_OPENAI_FINISH_REASONS.has(choice.finish_reason)) return body;
+  const next = [...choices];
+  next[0] = { ...choice, finish_reason: 'stop' };
+  return { ...body, choices: next };
+}
+
 /** A rough token count for a text: a token per four bytes, and never zero for a non-empty text. */
 function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(Buffer.byteLength(text) / 4));
