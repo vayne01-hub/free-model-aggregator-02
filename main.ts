@@ -33,20 +33,38 @@
 //
 // FAILOVER (10%) ON A FREE-TIER KEY
 //   The key behind this entry is a free-tier one (about 50 free-model requests a day), so calls
-//   are spent like they matter: one at a time, never in parallel, never speculatively, and a
-//   retry only ever follows an actual refusal. When a call is refused (a 4xx or 5xx relayed
-//   from the provider), the walk moves to the next ranked candidate that meets the prompt; a
-//   5xx earns its model exactly one immediate retry first, since a server error is often a
-//   moment's fault and the retry keeps the prompt on its best model. A model that answered 429
-//   is remembered for the rest of the trial (lib/routing.ts RefusalBook) and walked past for
-//   later prompts — a free model's rate limit outlives this trial's seconds — unless it is the
-//   only candidate left. One prompt costs at most MAX_ATTEMPTS_PER_PROMPT calls; the
-//   whole trial stays far under the gateway's 60-call cap, and the common trial costs exactly
-//   one call per prompt, which is also what the score's tie-break rewards.
+//   are spent like they matter: one at a time, never in parallel, never speculatively. When a
+//   call is refused (a 4xx or 5xx relayed from the provider), the walk moves to the next ranked
+//   candidate that meets the prompt — never back to the model that just refused: on a free
+//   tier a refusal is a state, not a moment, and a same-model retry pays the refusal's price
+//   twice. Any refusal at all sidelines its model for the trial's later prompts
+//   (lib/routing.ts RefusalBook): a free model's rate limit, outage or bad-answer habit
+//   outlives this trial's seconds, so later prompts lead with a model that has not refused —
+//   unless it is the only candidate left. One prompt costs at most MAX_ATTEMPTS_PER_PROMPT
+//   calls; the whole trial stays far under the gateway's 60-call cap, and the common trial
+//   costs exactly one call per prompt, which is also what the score's tie-break rewards.
 //   A prompt recovered after refusals reports them on its response header
 //   `x-makefun-upstream-failures` (lib/routing.ts trailHeader): that header is the only way the
 //   failover column can see a refusal the walk recovered from, because the env sees this
 //   server's answers and never the gateway's traffic.
+//
+// VERIFICATION (served 15%, quality 60%) AND THE 30-SECOND BUDGET
+//   The house gives each prompt 30 seconds to be answered, and on the live provider a 200 is
+//   not always an answer: a model can refuse inside a 200 body, answer with no content (a
+//   reasoning model that spent its whole cap thinking), name a tool the client never
+//   declared, or ignore the instruction entirely — and every one of those relays as a silent
+//   zero, because the house scores the answer's text against the prompt's token. So every
+//   answer is read whole and verified before anything is relayed (lib/verify.ts), against the
+//   prompt's own token read off the client's body; an answer that would earn nothing is
+//   treated as a refusal and the walk moves on. Streams are buffered whole for the same
+//   reason: a stream is only relayed once its recorded bytes are known to close properly and
+//   to carry the token.
+//   Each attempt also carries a fixed time budget (lib/routing.ts ATTEMPT_TIMEOUT_MS): the
+//   first attempt may take 15 of the prompt's 30 seconds, later ones less, so one hanging
+//   model cannot spend the whole prompt. The budget only ever cuts an attempt short — the
+//   gateway tears the call down when this server lets go and the house's record keeps the
+//   partial answer, which verification rejects on the same bytes in a live pass and in its
+//   replay — so the walk's choices stay a function of the answers alone.
 //
 // THE MODEL RULE
 //   A response's `model` field names the model this server really dialled, on every answer and
@@ -70,13 +88,15 @@ import {
   type ModelRow,
   type Requirement,
 } from './lib/providers.ts';
-import { MAX_ATTEMPTS_PER_PROMPT, RefusalBook, refusalCode, trailHeader, type TrailRow } from './lib/routing.ts';
+import { MAX_ATTEMPTS_PER_PROMPT, RefusalBook, attemptTimeoutMs, refusalCode, trailHeader, type TrailRow } from './lib/routing.ts';
+import { declaredToolNames, tokenOfRequest, verifyJsonAnswer, verifyStreamAnswer } from './lib/verify.ts';
 import {
   anthropicError,
   anthropicEventsFromOpenAI,
   anthropicModelList,
   anthropicToOpenAI,
   ensureAnswerUsage,
+  ensureFinishReason,
   openAIError,
   openAIJsonWithModel,
   openAIModelList,
@@ -221,52 +241,97 @@ function buildUpstream(wire: 'openai' | 'anthropic', body: Json, model: ModelRow
   return withOutputCap({ ...body, model: model.id });
 }
 
-/** POST one attempt to the gateway's Chat Completions route, naming the model this entry dialled. */
-async function dial(model: string, body: Json): Promise<Response> {
+/**
+ * POST one attempt to the gateway's Chat Completions route, naming the model this entry
+ * dialled, under the attempt's time budget: the fetch — and the read of its body, which the
+ * same signal governs — is abandoned when the budget runs out, and the caller treats the
+ * attempt as refused (see isTimeoutError). The gateway tears the call down when this server
+ * lets go, so an abandoned attempt costs the budget and nothing else.
+ */
+async function dial(model: string, body: Json, timeoutMs: number): Promise<Response> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     authorization: `Bearer ${GATEWAY_KEY}`,
   };
   if (body.stream === true) headers.accept = 'text/event-stream';
-  return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
+  return fetch(chatCompletionsUrl(), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ ...body, model }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/** Whether a dial or a body read failed because the attempt's time budget ran out. */
+function isTimeoutError(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
+/** The response headers for a relayed answer: the refusal trail, when this prompt was recovered. */
+function relayHeaders(trail: readonly TrailRow[]): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const trailValue = trailHeader(trail);
+  if (trailValue !== null) headers['x-makefun-upstream-failures'] = trailValue;
+  return headers;
 }
 
 /**
- * A successful gateway answer, relayed to the client in its own wire: the dialled model's id on
- * every answer and every chunk, the usage and the stop reason whole, and the refusal trail on
- * the response header when this prompt was recovered after one or more refusals. A JSON answer's
- * usage is first made whole (lib/wire.ts ensureAnswerUsage): some free models answer with no
- * usage object at all, and the wire checks read one.
+ * A verified JSON answer, relayed to the client in its own wire: the dialled model's id on the
+ * answer, and its usage and finish reason first made whole (lib/wire.ts ensureAnswerUsage and
+ * ensureFinishReason): some free models answer with no usage object at all, or name no finish
+ * reason, and the wire checks read both.
  */
-async function relay(
+function relayJson(
   res: ServerResponse,
   wire: 'openai' | 'anthropic',
-  streamed: boolean,
-  upstream: Response,
+  answer: Json,
+  upstreamBody: Json,
+  model: ModelRow,
+  trail: readonly TrailRow[],
+): void {
+  const record = ensureAnswerUsage(ensureFinishReason(answer), JSON.stringify(upstreamBody.messages ?? []));
+  const headers = relayHeaders(trail);
+  if (wire === 'anthropic') sendJson(res, 200, openAIToAnthropic(record, model.id), headers);
+  else sendJson(res, 200, openAIJsonWithModel(record, model.id), headers);
+}
+
+/** A buffered stream's bytes as the readable the wire relays consume. */
+function streamOf(text: string): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+/**
+ * A verified stream, relayed to the client in its own wire from the bytes that were verified:
+ * the dialled model's id on every chunk, and the refusal trail on the response header when
+ * this prompt was recovered after one or more refusals. The bytes are the attempt's own, read
+ * whole during verification, so what is relayed is exactly what was checked.
+ */
+async function relayStream(
+  res: ServerResponse,
+  wire: 'openai' | 'anthropic',
+  raw: string,
   upstreamBody: Json,
   model: ModelRow,
   trail: readonly TrailRow[],
 ): Promise<void> {
-  const headers: Record<string, string> = {};
-  const trailValue = trailHeader(trail);
-  if (trailValue !== null) headers['x-makefun-upstream-failures'] = trailValue;
-  if (streamed) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...headers });
-    try {
-      if (wire === 'anthropic') {
-        for await (const event of anthropicEventsFromOpenAI(upstream.body as ReadableStream<Uint8Array>, model.id)) res.write(event);
-      } else {
-        for await (const frame of openAIStreamWithModel(upstream.body as ReadableStream<Uint8Array>, model.id, JSON.stringify(upstreamBody.messages ?? []))) res.write(frame);
-      }
-    } finally {
-      res.end();
+  const headers = relayHeaders(trail);
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...headers });
+  try {
+    if (wire === 'anthropic') {
+      for await (const event of anthropicEventsFromOpenAI(streamOf(raw), model.id)) res.write(event);
+    } else {
+      for await (const frame of openAIStreamWithModel(streamOf(raw), model.id, JSON.stringify(upstreamBody.messages ?? []))) res.write(frame);
     }
-    return;
+  } finally {
+    res.end();
   }
-  const answer: unknown = await upstream.json();
-  const record = ensureAnswerUsage(isRecord(answer) ? answer : {}, JSON.stringify(upstreamBody.messages ?? []));
-  if (wire === 'anthropic') sendJson(res, 200, openAIToAnthropic(record, model.id), headers);
-  else sendJson(res, 200, openAIJsonWithModel(record, model.id), headers);
 }
 
 /** A prompt every attempt failed: a 502 in the client's wire, with the trail of what refused it. */
@@ -286,9 +351,11 @@ function giveUp(
 
 /**
  * Serve one client request on either wire: rank the candidates that meet the prompt, walk them
- * in order, and relay the first answer the gateway gives. The walk is the failover design at the
- * top of this file — sequential, refusal-driven, one 5xx retry per model, capped per prompt —
- * and every step of it is decided by the responses alone, so a replay walks it identically.
+ * in order, and relay the first answer that verifies. The walk is the design at the top of this
+ * file — sequential, refusal-driven, one attempt per model, capped per prompt, each attempt
+ * under its time budget, and an answer relayed only once it is verified against the prompt's
+ * token — and every step of it is decided by the responses alone, so a replay walks it
+ * identically.
  */
 async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' | 'anthropic'): Promise<void> {
   const body = await readJson(req);
@@ -297,45 +364,98 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
   if (candidates.length === 0) {
     return sendError(res, wire, 503, wire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model in the brief meets this request');
   }
+  const token = tokenOfRequest(body);
+  const declared = declaredToolNames(wire, body);
+  const streamed = body.stream === true;
   const trail: TrailRow[] = [];
-  const retried = new Set<string>();
   let last: { status: number; text: string } | null = null;
+  // The house hangs up on a prompt it has waited 30 seconds for; from then on no attempt can
+  // earn anything for this prompt, and the calls further attempts would cost are the key's to
+  // keep for the prompts still to come. A replay is never hung up on — the recorded answers
+  // arrive at once — so this only ever stops a walk the live pass had already lost.
+  let abandoned = false;
+  res.on('close', () => {
+    abandoned = true;
+  });
   let attempts = 0;
   let index = 0;
   while (index < candidates.length && attempts < MAX_ATTEMPTS_PER_PROMPT) {
+    if (abandoned) return;
     const model = candidates[index];
+    index += 1;
+    const timeoutMs = attemptTimeoutMs(attempts);
     attempts += 1;
     const upstreamBody = buildUpstream(wire, body, model);
     let upstream: Response;
     try {
-      upstream = await dial(model.id, upstreamBody);
+      upstream = await dial(model.id, upstreamBody, timeoutMs);
     } catch (err) {
-      // The gateway itself did not answer: no response exists to trail, and the walk moves on.
-      last = { status: 502, text: (err as Error).message };
-      index += 1;
+      if (isTimeoutError(err)) {
+        // The attempt produced no answer within its budget: trailed and noted like a refusal,
+        // because a model too slow to answer inside the budget is, for this trial, down.
+        trail.push({ status: 504, code: 'attempt_timeout', model: model.id });
+        book.note(model.id, 504);
+        last = { status: 504, text: `no answer within ${timeoutMs} ms` };
+      } else {
+        // The gateway itself did not answer: no response exists to trail, and the walk moves on.
+        last = { status: 502, text: (err as Error).message };
+      }
       continue;
     }
-    if (upstream.ok && upstream.body !== null) {
-      await relay(res, wire, body.stream === true, upstream, upstreamBody, model, trail);
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => '');
+      trail.push({ status: upstream.status, code: refusalCode(upstream.status, text), model: model.id });
+      book.note(model.id, upstream.status);
+      last = { status: upstream.status, text };
+      continue;
+    }
+    // A 2xx: read the whole answer before anything is relayed — the attempt's budget still
+    // governs the read — and verify it; an answer that would earn nothing is a refusal.
+    let raw: string;
+    try {
+      raw = await upstream.text();
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        trail.push({ status: 504, code: 'attempt_timeout', model: model.id });
+        book.note(model.id, 504);
+        last = { status: 504, text: `the answer did not finish within ${timeoutMs} ms` };
+      } else {
+        last = { status: 502, text: (err as Error).message };
+      }
+      continue;
+    }
+    if (streamed) {
+      const verdict = verifyStreamAnswer(raw, token, declared);
+      if (!verdict.ok) {
+        trail.push({ status: upstream.status, code: verdict.code, model: model.id });
+        book.note(model.id, upstream.status);
+        last = { status: upstream.status, text: raw };
+        continue;
+      }
+      await relayStream(res, wire, raw, upstreamBody, model, trail);
       return;
     }
-    if (upstream.ok) {
-      // A 2xx with no body is not an answer a client can be served; nothing was refused, so the
-      // trail stays empty, and the prompt is given up rather than walked further on a guess.
-      last = { status: 502, text: 'the gateway answered with no body' };
-      break;
+    let answer: unknown = null;
+    try {
+      answer = JSON.parse(raw);
+    } catch {
+      // Not JSON at all: the verdict below names it bad_body.
     }
-    const text = await upstream.text().catch(() => '');
-    trail.push({ status: upstream.status, code: refusalCode(upstream.status, text), model: model.id });
-    book.note(model.id, upstream.status);
-    last = { status: upstream.status, text };
-    if (upstream.status >= 500 && !retried.has(model.id) && attempts < MAX_ATTEMPTS_PER_PROMPT) {
-      // One immediate retry for a server error: it keeps the prompt on its best model when the
-      // fault was a moment's, and it costs exactly the one call a failover would have cost.
-      retried.add(model.id);
+    if (!isRecord(answer)) {
+      trail.push({ status: upstream.status, code: 'bad_body', model: model.id });
+      book.note(model.id, upstream.status);
+      last = { status: upstream.status, text: raw };
       continue;
     }
-    index += 1;
+    const verdict = verifyJsonAnswer(answer, token, declared);
+    if (!verdict.ok) {
+      trail.push({ status: upstream.status, code: verdict.code, model: model.id });
+      book.note(model.id, upstream.status);
+      last = { status: upstream.status, text: raw };
+      continue;
+    }
+    relayJson(res, wire, answer, upstreamBody, model, trail);
+    return;
   }
   giveUp(res, wire, last, trail);
 }
