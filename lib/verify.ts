@@ -127,9 +127,13 @@ function framePayload(frame: string): string | null {
  * Verify one streamed Chat Completions answer, read whole before anything is relayed: the
  * frames parse the way the house parses them, no frame carries a provider error or a
  * choiceless payload, the stream closes with a finish chunk and then [DONE] with nothing
- * after it, only declared tools are named, and the token is in the streamed text. A stream
- * cut short — by the provider, or by the attempt's own time budget — fails here on the same
- * bytes in a live pass and in its replay, so the walk moves on identically in both.
+ * after it, only declared tools are named, and the token is in the streamed text. The order
+ * rules are the house's own, read the same way it reads them: a content delta that follows
+ * the finish chunk, or a second finish chunk, fails the stream here just as it fails the
+ * house's stream_order check there — a stream the house would mark out of order is a refusal,
+ * and the walk moves on rather than relay a silent zero. A stream cut short — by the
+ * provider, or by the attempt's own time budget — fails here on the same bytes in a live pass
+ * and in its replay, so the walk moves on identically in both.
  */
 export function verifyStreamAnswer(raw: string, token: string | null, declared: readonly string[]): Verdict {
   const frames = raw.replace(/\r\n/g, '\n').split('\n\n');
@@ -161,10 +165,16 @@ export function verifyStreamAnswer(raw: string, token: string | null, declared: 
     const choice = chunk.choices[0];
     if (!isRecord(choice)) return fail('bad_stream');
     if (isRecord(choice.delta)) {
-      if (typeof choice.delta.content === 'string') text += choice.delta.content;
+      if (typeof choice.delta.content === 'string') {
+        if (choice.delta.content !== '' && sawFinish) return fail('bad_stream');
+        text += choice.delta.content;
+      }
       toolNames.push(...toolNamesOf(choice.delta.tool_calls));
     }
-    if (typeof choice.finish_reason === 'string') sawFinish = true;
+    if (typeof choice.finish_reason === 'string') {
+      if (sawFinish) return fail('bad_stream');
+      sawFinish = true;
+    }
   }
   if (!sawFinish || !sawDone) return fail('bad_stream');
   const tools = toolsVerdict(toolNames, declared);
