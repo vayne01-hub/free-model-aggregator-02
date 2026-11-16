@@ -345,9 +345,13 @@ function frameWithModel(frame: string, model: string): string {
  * One repair is made on the way through. The gateway forwards with stream_options.include_usage set,
  * so a usage chunk should close the stream — but a provider that ignores the option leaves the client
  * with no usage to read, and the wire checks read one. When the stream produced content yet no chunk
- * carried usage, a closing usage chunk is synthesised just before [DONE], in the place OpenAI itself
+ * carried a whole usage — an input count and an output count of at least 1, the figures the wire
+ * checks read; a chunk that names an output of zero beside streamed content is no more whole than
+ * none — a closing usage chunk is synthesised just before [DONE], in the place OpenAI itself
  * puts it: the output count estimated from the streamed content, the input from the prompt's text
- * (promptText), both by estimateTokens' rule. A stream that did carry usage passes untouched.
+ * (promptText), both by estimateTokens' rule. The synthesised chunk follows the provider's own, so
+ * a reader that takes the last usage reads the whole one. A stream that did carry a whole usage
+ * passes untouched.
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string, promptText: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -379,7 +383,7 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       if (!isRecord(chunk)) continue;
       if (typeof chunk.id === 'string' && chunk.id !== '') lastId = chunk.id;
       if (typeof chunk.created === 'number') lastCreated = chunk.created;
-      if (isRecord(chunk.usage) && typeof chunk.usage.completion_tokens === 'number') sawUsage = true;
+      if (isRecord(chunk.usage) && typeof chunk.usage.prompt_tokens === 'number' && typeof chunk.usage.completion_tokens === 'number' && chunk.usage.completion_tokens >= 1) sawUsage = true;
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       const choice = isRecord(choices[0]) ? choices[0] : null;
       if (choice === null || !isRecord(choice.delta)) continue;
